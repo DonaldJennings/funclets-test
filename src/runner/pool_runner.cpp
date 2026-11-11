@@ -11,10 +11,16 @@
 
 #include "runner_common.h"
 
+#include <csignal>
 #include <sys/prctl.h>
 
 int main()
 {
+    // A write to a socket whose peer has gone away must fail with EPIPE, not
+    // kill the worker. The NDP socket code uses MSG_NOSIGNAL already; this
+    // covers every other socket and pipe in the process.
+    std::signal(SIGPIPE, SIG_IGN);
+
     runner::commonInit();
     if (faabric::util::getSystemConfig().isStorageNode) {
         prctl(PR_SET_NAME, "pool_runner[S]");

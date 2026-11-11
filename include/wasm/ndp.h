@@ -1,46 +1,24 @@
 #pragma once
 
-#include <array>
 #include <cstdint>
-#include <flatbuffers/flatbuffer_builder.h>
 #include <functional>
 #include <span>
-#include <sstream>
-#include <string>
-#include <tl/expected.hpp>
 #include <vector>
 
 #include <cephclass/cephcomm.h>
 #include <faabric/util/asio.h>
-#include <faabric/util/bytes.h>
 
 namespace faasm {
 
-struct CephSocketCloser
-{
-  public:
-    CephSocketCloser() = default;
-    CephSocketCloser(const CephSocketCloser&) = delete;
-    CephSocketCloser& operator=(const CephSocketCloser&) = delete;
-    CephSocketCloser(CephSocketCloser&&) = default;
-    CephSocketCloser& operator=(CephSocketCloser&&) = default;
-    CephSocketCloser(std::shared_ptr<CephFaasmSocket> socket, uint64_t id)
-      : socket(std::move(socket))
-      , id(id)
-    {
-    }
-
-    ~CephSocketCloser();
-
-    std::shared_ptr<CephFaasmSocket> socket;
-    uint64_t id;
-};
-
+// Asio start hook for the storage worker: accepts connections from the Ceph
+// object class on the NDP unix socket.
 std::function<void(asio::io_context&)> getNdpEndpoint();
 
-std::shared_ptr<CephFaasmSocket> getNdpSocketFromCall(uint64_t id);
-
-tl::expected<std::vector<uint8_t>, std::exception_ptr> awaitNdpResponse(
-  uint64_t id);
+// Sends a storage message (NdpRead/NdpWrite) for an offloaded call to the OSD
+// that started it, and returns the OSD's reply. Calls for the same id are
+// serialised. Throws std::runtime_error (or a subclass) if the call is not
+// known, the OSD reported an error, or the connection failed or timed out.
+std::vector<uint8_t> ndpStorageRoundTrip(uint64_t callId,
+                                         std::span<const uint8_t> request);
 
 }
