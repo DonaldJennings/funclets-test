@@ -2,7 +2,9 @@
 
 ## Ceph-Faasm communication via the unix domain socket
 
- - Faasm listens on a `SOCK_STREAM` UDS at `/run/faasm-ndp.sock`
+ - Faasm listens on a `SOCK_STREAM` UDS at `/run/faasm/faasm-ndp.sock`. See
+   `ndp_stability.md` for the failure modes of this protocol and how to
+   stress-test it
  - NDP calls are ran as follows:
    - Compute Faasm: rados_aio_exec (object, class="faasm", method="maybe_exec_wasm_ro")
    - Input sent: object path, calling node hostname
