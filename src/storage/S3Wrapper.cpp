@@ -694,15 +694,6 @@ std::string S3Wrapper::getKeyStr(const std::string& bucketName,
       getKeyBytes(bucketName, keyName, false));
 }
 
-void completion_callback(rados_completion_t completion, void *arg) {
-    int result = rados_aio_get_return_value(completion);
-    if (result < 0) {
-        SPDLOG_ERROR("NDP call failed with error: {}", result);
-    } else {
-        SPDLOG_DEBUG("NDP call completed successfully");
-    }
-}
-
 int S3Wrapper::asyncNdpCall(const std::string& bucketName,
                                         const std::string& keyName,
                                         const std::string& funcClass,
@@ -723,18 +714,23 @@ int S3Wrapper::asyncNdpCall(const std::string& bucketName,
         SPDLOG_ERROR("Key {}/{} cannot be run: no pool", bucketName, keyName);
         throw std::runtime_error("Key cannot be run.");
     }
-    
-    rados_completion_t completion;
-    rados_aio_create_completion(nullptr, nullptr, completion_callback, &completion);
-    int ec = rados_aio_exec(pool->ioctx,
-                            keyName.c_str(),
-                            completion,
-                            funcClass.c_str(),
-                            funcName.c_str(),
-                            reinterpret_cast<const char*>(inputData.data()),
-                            inputData.size(),
-                            reinterpret_cast<char*>(outputBuffer.data()),
-                            outputBuffer.size());
+
+    rados_completion_t completion = nullptr;
+    int ec =
+      rados_aio_create_completion(nullptr, nullptr, nullptr, &completion);
+    if (ec < 0) {
+        SPDLOG_ERROR("Couldn't create a rados completion: {}", strerror(-ec));
+        throw std::runtime_error("Couldn't create a rados completion");
+    }
+    ec = rados_aio_exec(pool->ioctx,
+                        keyName.c_str(),
+                        completion,
+                        funcClass.c_str(),
+                        funcName.c_str(),
+                        reinterpret_cast<const char*>(inputData.data()),
+                        inputData.size(),
+                        reinterpret_cast<char*>(outputBuffer.data()),
+                        outputBuffer.size());
     // int ec = rados_exec(pool->ioctx,
     //                     keyName.c_str(),
     //                     funcClass.c_str(),
@@ -745,6 +741,7 @@ int S3Wrapper::asyncNdpCall(const std::string& bucketName,
     //                     outputBuffer.size());
 
     if (ec < 0) {
+        rados_aio_release(completion);
 
         switch(ec)
         {
@@ -778,9 +775,21 @@ int S3Wrapper::asyncNdpCall(const std::string& bucketName,
         }
     }
 
+    // rados_aio_exec only reports whether the op was submitted. The object
+    // class call's own result (output length or -errno) is on the completion.
+    // There is no timeout here: set `rados osd op timeout` in ceph.conf so a
+    // stuck OSD can't hang this thread forever.
     rados_aio_wait_for_complete(completion);
+    const int result = rados_aio_get_return_value(completion);
     rados_aio_release(completion);
-    // return completion;
-    return ec;
+    if (result < 0) {
+        SPDLOG_ERROR("NDP call {}:{} on {}/{} failed: {}",
+                     funcClass,
+                     funcName,
+                     bucketName,
+                     keyName,
+                     strerror(-result));
+    }
+    return result;
 }
 }

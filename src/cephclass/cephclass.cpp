@@ -5,6 +5,8 @@
 #include <unistd.h>
 #define FMT_ENFORCE_COMPILE_STRING
 
+#include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
@@ -13,6 +15,9 @@
 #include <fmt/compile.h>
 #include <fmt/core.h>
 #include <memory>
+#include <optional>
+#include <string>
+#include <vector>
 
 #include <rados/objclass.h>
 #include <stdexcept>
@@ -87,48 +92,86 @@ std::vector<uint8_t> cephBufferToVecU8(const ceph::buffer::list& buflist)
     return output;
 }
 
+// The OSD holds the PG lock while this runs, and its op thread heartbeat
+// (osd_op_thread_timeout, 15 s by default) is not reset by object classes, so
+// every wait here must be bounded.
+constexpr int INITIAL_RESPONSE_TIMEOUT_MS = 5000;
+constexpr int STORAGE_MESSAGE_TIMEOUT_MS = 30000;
+// The compute node's output buffer for the response is 1 KiB
+constexpr size_t MAX_ERROR_MSG_LEN = 512;
+
+std::vector<uint8_t> buildNdpResponse(uint64_t callId,
+                                      ndpmsg::NdpResult result,
+                                      std::string errorMsg)
+{
+    if (errorMsg.size() > MAX_ERROR_MSG_LEN) {
+        errorMsg.resize(MAX_ERROR_MSG_LEN);
+    }
+    flatbuffers::FlatBufferBuilder builder(256);
+    auto errorField = builder.CreateString(errorMsg);
+    ndpmsg::NdpResponseBuilder respBuilder(builder);
+    respBuilder.add_call_id(callId);
+    respBuilder.add_result(result);
+    respBuilder.add_error_msg(errorField);
+    builder.Finish(respBuilder.Finish());
+    return { builder.GetBufferPointer(),
+             builder.GetBufferPointer() + builder.GetSize() };
+}
+
 int maybe_exec_wasm(cls_method_context_t hctx,
                     ceph::buffer::list* inBuffers,
                     ceph::buffer::list* outBuffers,
                     bool readAllowed,
                     bool writeAllowed)
 {
-    SPDLOG_INFO(fmt::format(FMT_STRING("maybe_exec_wasm called {} {} {}"), inBuffers->length(), readAllowed, writeAllowed));
-    
     if (inBuffers == nullptr || outBuffers == nullptr ||
         !(readAllowed || writeAllowed)) {
         SPDLOG_ERROR("Invalid arguments to maybe_exec_wasm");
         return -EINVAL;
     }
-    CLS_LOG(3, "");
+    SPDLOG_DEBUG(fmt::format(FMT_STRING("maybe_exec_wasm called {} {} {}"),
+                             inBuffers->length(),
+                             readAllowed,
+                             writeAllowed));
 
     uint64_t callId = 0;
     ndpmsg::NdpResult result = ndpmsg::NdpResult_Ok;
     std::string errorMsg;
 
     try {
-        CLS_LOG(1,"Received NDP call request of size %d bytes",(int)inBuffers->length());
-        SPDLOG_INFO(fmt::format(FMT_STRING("Received NDP call of size {} bytes"), inBuffers->length()));
+        CLS_LOG(5,
+                "Received NDP call request of size %d bytes",
+                (int)inBuffers->length());
         auto input = cephBufferToVecU8(*inBuffers);
 
         verifyFlatbuf<ndpmsg::NdpRequest>(input);
-        SPDLOG_INFO("Verified flatbuffer for input NDP request");
-
-
         const auto* req = flatbuffers::GetRoot<ndpmsg::NdpRequest>(input.data());
         callId = req->call_id();
-        SPDLOG_INFO(fmt::format(FMT_STRING("Received call id {}"), callId));
+        SPDLOG_DEBUG(fmt::format(FMT_STRING("Received call id {}"), callId));
 
-        // Connect to the Faasm runtime
-        CLS_LOG(3, "Connecting to Faasm runtime UDS");
-        SPDLOG_DEBUG("Connecting to Faasm runtime UDS");
-        CephFaasmSocket runtime(SocketType::connect);
+        // Connect to the Faasm runtime. If it isn't running, let the compute
+        // node run the call itself rather than failing it.
+        std::optional<CephFaasmSocket> runtimeHolder;
+        try {
+            runtimeHolder.emplace(SocketType::connect);
+        } catch (const NdpRuntimeUnavailable& e) {
+            SPDLOG_WARN(fmt::format(
+              FMT_STRING("NDP call {}: {}, asking compute node to process "
+                         "locally"),
+              callId,
+              e.what()));
+            auto resp =
+              buildNdpResponse(callId, ndpmsg::NdpResult_ProcessLocally, "");
+            outBuffers->append(reinterpret_cast<const char*>(resp.data()),
+                               resp.size());
+            return 0;
+        }
+        CephFaasmSocket& runtime = *runtimeHolder;
 
-        // Forward the NDP request
-        CLS_LOG(3,"Forwarding call request %llu to the Faasm runtime",static_cast<unsigned long long>(callId));
-        SPDLOG_DEBUG("Forwarding call request to the Faasm runtime");
-
-        // Create request to NDP from Storage Ceph to Storage Faasm
+        // Forward the request from Storage Ceph to Storage Faasm
+        CLS_LOG(5,
+                "Forwarding call request %llu to the Faasm runtime",
+                static_cast<unsigned long long>(callId));
         fbs::FlatBufferBuilder fwdBuilder(input.size() + 128);
         {
             auto reqOffset = fwdBuilder.CreateVector(input);
@@ -137,72 +180,92 @@ int maybe_exec_wasm(cls_method_context_t hctx,
               ndpmsg::CreateCephNdpRequest(fwdBuilder, reqOffset, hnOffset);
             fwdBuilder.Finish(ndpOffset);
         }
-        SPDLOG_INFO("Finished creating flatbuffer for NDP request");
-       
-        // Send message over the FAASM UDS
-        runtime.sendMessage(fwdBuilder.GetBufferPointer(), fwdBuilder.GetSize());
-        SPDLOG_INFO("Sent message over the FAASM UDS");
+        runtime.sendMessage(fwdBuilder.GetBufferPointer(),
+                            fwdBuilder.GetSize(),
+                            INITIAL_RESPONSE_TIMEOUT_MS);
 
-        if (!runtime.pollFor(POLLIN, 5000)) {
-            // timed out
-            SPDLOG_ERROR("[Initial Polling] Timed out waiting for Faasm-storage messages");
-            return -ETIMEDOUT;
+        if (!runtime.pollFor(POLLIN, INITIAL_RESPONSE_TIMEOUT_MS)) {
+            throw std::runtime_error(
+              "Timed out waiting for the Faasm runtime to accept the call");
         }
-
-        // Receive response from the FAASM UDS
-        const auto initialRuntimeResponseData = runtime.recvMessageVector();
+        const auto initialRuntimeResponseData =
+          runtime.recvMessageVector(INITIAL_RESPONSE_TIMEOUT_MS);
         verifyFlatbuf<ndpmsg::NdpResponse>(initialRuntimeResponseData);
-        const auto* initialRuntimeResponse =flatbuffers::GetRoot<ndpmsg::NdpResponse>(initialRuntimeResponseData.data());
-        SPDLOG_INFO("Received response from Faasm runtime");
+        const auto* initialRuntimeResponse =
+          flatbuffers::GetRoot<ndpmsg::NdpResponse>(
+            initialRuntimeResponseData.data());
 
         if (initialRuntimeResponse->call_id() != callId) {
-            SPDLOG_INFO("Mismatched call ids!");
             throw std::runtime_error("Mismatched call ids!");
         }
         if (initialRuntimeResponse->result() != ndpmsg::NdpResult_Ok) {
-            // Forward the error and finish.
-            SPDLOG_ERROR("Error in initial runtime response");
-            outBuffers->append(reinterpret_cast<const char*>(initialRuntimeResponseData.data()), initialRuntimeResponseData.size());
+            // ProcessLocally or Error: forward it to the compute node as is
+            SPDLOG_DEBUG("Faasm runtime did not accept the call");
+            outBuffers->append(
+              reinterpret_cast<const char*>(initialRuntimeResponseData.data()),
+              initialRuntimeResponseData.size());
             return 0;
         }
 
-        // Communicate with the runtime to process any read/write commands
+        // Serve the funclet's reads and writes until it sends NdpEnd
         bool running = true;
         ceph::buffer::list readBufferList;
         while (running) {
             readBufferList.clear();
 
-            if (!runtime.pollFor(POLLIN, 30000)) {
-                // timed out
-                errorMsg = "[Running Polling] Timed out waiting for Faasm-storage messages";
-                result = ndpmsg::NdpResult_Error;
-                running = false;
-                break;
+            if (!runtime.pollFor(POLLIN, STORAGE_MESSAGE_TIMEOUT_MS)) {
+                throw std::runtime_error(
+                  "Timed out waiting for Faasm-storage messages");
             }
 
-            const auto msgData = runtime.recvMessageVector();
+            const auto msgData =
+              runtime.recvMessageVector(STORAGE_MESSAGE_TIMEOUT_MS);
             verifyFlatbuf<ndpmsg::StorageMessage>(msgData);
-            const auto* topMsg = flatbuffers::GetRoot<ndpmsg::StorageMessage>(msgData.data());
+            const auto* topMsg =
+              flatbuffers::GetRoot<ndpmsg::StorageMessage>(msgData.data());
             if (topMsg->call_id() != callId) {
                 throw std::runtime_error(
                   "Mismatched call ids in storage message!");
             }
             switch (topMsg->message_type()) {
                 case ndpmsg::TypedStorageMessage_NdpEnd: {
-                    CLS_LOG(1, "Received NDP end");
-                    SPDLOG_INFO("Received NDP end");
+                    CLS_LOG(5, "Received NDP end");
+                    const auto* msg = topMsg->message_as_NdpEnd();
+                    if (msg->result() != ndpmsg::NdpResult_Ok) {
+                        result = ndpmsg::NdpResult_Error;
+                        errorMsg = "Faasm storage runtime failed the call";
+                        if (msg->error_msg() != nullptr &&
+                            msg->error_msg()->size() > 0) {
+                            errorMsg =
+                              std::string(reinterpret_cast<const char*>(
+                                            msg->error_msg()->data()),
+                                          msg->error_msg()->size());
+                        }
+                    }
                     running = false;
                     break;
                 }
                 case ndpmsg::TypedStorageMessage_NdpRead: {
-                    CLS_LOG(1, "Received NDP read");
-                    SPDLOG_INFO("Received NDP read");
+                    CLS_LOG(5, "Received NDP read");
                     const auto* msg = topMsg->message_as_NdpRead();
+                    if (!readAllowed) {
+                        runtime.sendError();
+                        throw std::runtime_error(
+                          "NDP read in a write-only object class method");
+                    }
+                    if (msg->offset() > uint64_t(INT32_MAX)) {
+                        runtime.sendError();
+                        throw std::runtime_error("NDP read offset too large");
+                    }
+                    const int readLen =
+                      int(std::min<uint64_t>(msg->upto_length(), INT32_MAX));
                     int ec = cls_cxx_read(
-                      hctx, msg->offset(), msg->upto_length(), &readBufferList);
+                      hctx, int(msg->offset()), readLen, &readBufferList);
                     if (ec < 0) {
                         runtime.sendError();
-                        throw std::runtime_error("Error in a read operation");
+                        throw std::runtime_error(
+                          std::string("Error in a read operation: ") +
+                          strerror(-ec));
                     }
                     runtime.sendMessage(
                       reinterpret_cast<const uint8_t*>(readBufferList.c_str()),
@@ -210,9 +273,25 @@ int maybe_exec_wasm(cls_method_context_t hctx,
                     break;
                 }
                 case ndpmsg::TypedStorageMessage_NdpWrite: {
-                    CLS_LOG(1, "Received NDP write");
-                    SPDLOG_INFO("Received NDP write");
+                    CLS_LOG(5, "Received NDP write");
                     const auto* msg = topMsg->message_as_NdpWrite();
+                    if (!writeAllowed) {
+                        // Writing from a method registered without
+                        // CLS_METHOD_WR trips
+                        // ceph_assert(op->may_write() || op->may_cache())
+                        // in PrimaryLogPG::execute_ctx and aborts the OSD.
+                        runtime.sendError();
+                        throw std::runtime_error(
+                          "NDP write to the call's object in a read-only "
+                          "call: use maybe_exec_wasm_rw for functions that "
+                          "write to their input object");
+                    }
+                    if (msg->data() == nullptr ||
+                        msg->offset() > uint64_t(INT32_MAX) ||
+                        msg->data()->size() > uint32_t(INT32_MAX)) {
+                        runtime.sendError();
+                        throw std::runtime_error("Invalid NDP write");
+                    }
                     // Const cast safety: we do not modify the data in the
                     // buffer.
                     auto writeBufferList = ceph::bufferlist::static_from_mem(
@@ -220,12 +299,14 @@ int maybe_exec_wasm(cls_method_context_t hctx,
                         reinterpret_cast<const char*>(msg->data()->data())),
                       msg->data()->size());
                     int ec = cls_cxx_write(hctx,
-                                           msg->offset(),
-                                           msg->data()->size(),
+                                           int(msg->offset()),
+                                           int(msg->data()->size()),
                                            &writeBufferList);
                     if (ec < 0) {
                         runtime.sendError();
-                        throw std::runtime_error("Error in a write operation");
+                        throw std::runtime_error(
+                          std::string("Error in a write operation: ") +
+                          strerror(-ec));
                     }
                     uint8_t OK_MSG[2] = { 'o', 'k' };
                     runtime.sendMessage(OK_MSG, sizeof(OK_MSG));
@@ -240,42 +321,26 @@ int maybe_exec_wasm(cls_method_context_t hctx,
     } catch (const std::exception& e) {
         result = ndpmsg::NdpResult_Error;
         errorMsg = fmt::format(
-          FMT_STRING(
-            "Exception caught in maybe_exec_wasm call {}: {}; errno={}"),
+          FMT_STRING("Exception caught in maybe_exec_wasm call {}: {}"),
           callId,
-          e.what(),
-          strerror(errno));
-        CLS_LOG(3, "%s", errorMsg.c_str());
+          e.what());
+        CLS_LOG(0, "%s", errorMsg.c_str());
         SPDLOG_ERROR(errorMsg.c_str());
     } catch (...) {
         result = ndpmsg::NdpResult_Error;
-        errorMsg = fmt::format(FMT_STRING("Unknown exception type caught in "
-                                          "maybe_exec_wasm call {}; errno={}"),
-                               callId,
-                               strerror(errno));
-        CLS_LOG(3, "%s", errorMsg.c_str());
+        errorMsg = fmt::format(
+          FMT_STRING(
+            "Unknown exception type caught in maybe_exec_wasm call {}"),
+          callId);
+        CLS_LOG(0, "%s", errorMsg.c_str());
         SPDLOG_ERROR(errorMsg.c_str());
     }
 
     // Construct response to Compute Faasm runtime
-    SPDLOG_INFO("Constructing response to Compute Faasm runtime");
-    flatbuffers::FlatBufferBuilder builder(256);
-    auto errorField = builder.CreateString(errorMsg);
-    ndpmsg::NdpResponseBuilder respBuilder(builder);
-    respBuilder.add_call_id(callId);
-    respBuilder.add_result(result);
-    respBuilder.add_error_msg(errorField);
-
-    auto resp = respBuilder.Finish();
-    builder.Finish(resp);
-    outBuffers->append(
-      reinterpret_cast<const char*>(builder.GetBufferPointer()),
-      builder.GetSize());
-
-    SPDLOG_INFO("Finished constructing response to Compute Faasm runtime");
+    auto resp = buildNdpResponse(callId, result, errorMsg);
+    outBuffers->append(reinterpret_cast<const char*>(resp.data()), resp.size());
     return 0;
 }
-
 }
 
 int maybe_exec_wasm_ro(cls_method_context_t hctx,

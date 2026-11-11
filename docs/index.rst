@@ -43,6 +43,7 @@ Experiments and benchmarks:
    source/kubernetes
    source/mpi
    source/ndp
+   source/ndp_stability
    source/networking
    source/profiling
    source/proto_faaslets
